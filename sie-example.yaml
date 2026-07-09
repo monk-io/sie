@@ -1,0 +1,55 @@
+namespace: sie
+
+example:
+  defines: runnable
+  metadata:
+    name: SIE (single container)
+    description: All-in-one Superlinked Inference Engine serving BAAI/bge-m3 (and other models) over HTTP. Set the plain Monk secret hf-token for model downloads.
+    tags: sie, embeddings, bge-m3, inference, quickstart
+    publisher: monk.io
+    private: false
+  permitted-secrets:
+    hf-token: true
+  variables:
+    hf-token:
+      type: string
+      value: <- secret("hf-token")
+      env: HF_TOKEN
+  containers:
+    sie:
+      image: ghcr.io/superlinked/sie-server:v0.6.16-cpu-default
+      restart: unless-stopped
+      paths:
+        - <- `${volume-path}/sie-example-hf-cache:/app/.cache/huggingface`
+  services:
+    http:
+      container: sie
+      port: 8080
+      protocol: tcp
+      description: SIE HTTP API (OpenAI-compatible /v1/embeddings, /v1/encode, /healthz, /readyz).
+      ingress-routes:
+        api:
+          path-prefix: /
+  files:
+    readiness-probe:
+      container: sie
+      path: /readiness_probe.py
+      mode: 0755
+      contents: |
+        import json, sys, urllib.request
+        try:
+            req = urllib.request.Request(
+                "http://localhost:8080/v1/encode/BAAI/bge-m3",
+                data=json.dumps({"items": [{"text": "readiness probe"}]}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            ok = urllib.request.urlopen(req, timeout=10).status == 200
+        except Exception:
+            ok = False
+        sys.stdout.write("READY" if ok else "NO")
+  checks:
+    readiness:
+      code: exec("sie", "python3", "/readiness_probe.py") contains?("READY")
+      period: 15
+      initialDelay: 30
+      attempts: 120

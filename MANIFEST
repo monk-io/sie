@@ -1,0 +1,9 @@
+REPO sie
+
+LOAD sie.yaml
+LOAD sie-example.yaml
+LOAD sie-stack.yaml
+
+SECRET hf-token
+
+ENTRY sie/stack
