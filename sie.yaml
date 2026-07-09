@@ -1,0 +1,416 @@
+namespace: sie
+
+nats:
+  defines: runnable
+  metadata:
+    name: SIE NATS (JetStream)
+    description: NATS server with JetStream enabled — the SIE work queue and config delta bus.
+  containers:
+    nats:
+      image: nats:2.10-alpine
+      restart: unless-stopped
+      bash: nats-server -js -m 8222
+      paths:
+        - <- `${volume-path}/sie-nats-js:/data`
+  services:
+    client:
+      container: nats
+      port: 4222
+      protocol: tcp
+      description: NATS client port (SIE_NATS_URL target).
+    monitor:
+      container: nats
+      port: 8222
+      protocol: tcp
+      description: NATS HTTP monitoring endpoint (used for readiness).
+  checks:
+    readiness:
+      code: http-get-service("sie/nats", "monitor", "/healthz") get-member("status") 200 equal?
+      period: 5
+      initialDelay: 3
+      attempts: 24
+
+config:
+  defines: runnable
+  metadata:
+    name: SIE Config
+    description: SIE control plane — owns config writes, persistence, and NATS delta publication.
+  containers:
+    config:
+      image: ghcr.io/superlinked/sie-config:v0.6.16
+      restart: unless-stopped
+      paths:
+        - <- `${volume-path}/sie-config-store:/var/lib/sie-config`
+  connections:
+    nats:
+      runnable: sie/nats
+      service: client
+  depends:
+    wait-for:
+      runnables:
+        - sie/nats
+      timeout: 120
+  variables:
+    pod-name:
+      type: string
+      value: sie-config
+      env: POD_NAME
+    nats-url:
+      type: string
+      value: <- connection-hostname("nats") set-tmp("host") connection-port("nats") set-tmp("port") `nats://${host}:${port}`
+      env: SIE_NATS_URL
+    bundles-dir:
+      type: string
+      value: /app/bundles
+      env: SIE_BUNDLES_DIR
+    models-dir:
+      type: string
+      value: /app/models
+      env: SIE_MODELS_DIR
+    log-level:
+      type: string
+      value: INFO
+      env: SIE_LOG_LEVEL
+    log-json:
+      type: string
+      value: "true"
+      env: SIE_LOG_JSON
+    config-store-dir:
+      type: string
+      value: /var/lib/sie-config
+      env: SIE_CONFIG_STORE_DIR
+    config-restore:
+      type: string
+      value: "true"
+      env: SIE_CONFIG_RESTORE
+  services:
+    http:
+      container: config
+      port: 8080
+      protocol: tcp
+      description: Internal config API (/v1/configs/export, /v1/configs/epoch, /readyz).
+  checks:
+    readiness:
+      code: http-get-service("sie/config", "http", "/readyz") get-member("status") 200 equal?
+      period: 5
+      initialDelay: 5
+      attempts: 24
+
+gateway:
+  defines: runnable
+  metadata:
+    name: SIE Gateway
+    description: SIE request gateway (Rust) — public API; publishes work to JetStream, discovers workers via NATS health.
+  containers:
+    gateway:
+      image: ghcr.io/superlinked/sie-gateway:v0.6.16
+      restart: unless-stopped
+  connections:
+    nats:
+      runnable: sie/nats
+      service: client
+    config:
+      runnable: sie/config
+      service: http
+  depends:
+    wait-for:
+      runnables:
+        - sie/nats
+        - sie/config
+      timeout: 300
+  variables:
+    nats-url:
+      type: string
+      value: <- connection-hostname("nats") set-tmp("host") connection-port("nats") set-tmp("port") `nats://${host}:${port}`
+      env: SIE_NATS_URL
+    config-service-url:
+      type: string
+      value: <- connection-hostname("config") set-tmp("host") connection-port("config") set-tmp("port") `http://${host}:${port}`
+      env: SIE_CONFIG_SERVICE_URL
+    trusted-producers:
+      type: string
+      value: sie-config
+      env: SIE_NATS_CONFIG_TRUSTED_PRODUCERS
+    health-mode:
+      type: string
+      value: nats
+      env: SIE_GATEWAY_HEALTH_MODE
+    configured-gpus:
+      type: string
+      value: cpu
+      env: SIE_GATEWAY_CONFIGURED_GPUS
+    gpu-aliases:
+      type: string
+      value: '{"cpu":"cpu"}'
+      env: SIE_GATEWAY_GPU_ALIASES
+    machine-profiles:
+      type: string
+      value: '{"cpu":{"gpuType":"","machineType":"","spot":false}}'
+      env: SIE_GATEWAY_MACHINE_PROFILES
+    multi-router:
+      type: string
+      value: "false"
+      env: SIE_MULTI_ROUTER
+    auth-mode:
+      type: string
+      value: none
+      env: SIE_AUTH_MODE
+    stream-max-age:
+      type: string
+      value: "1800"
+      env: SIE_STREAM_MAX_AGE_S
+    log-level:
+      type: string
+      value: INFO
+      env: SIE_LOG_LEVEL
+    log-json:
+      type: string
+      value: "true"
+      env: SIE_LOG_JSON
+  services:
+    http:
+      container: gateway
+      port: 8080
+      protocol: tcp
+      description: Public SIE API (OpenAI-compatible /v1/embeddings, encode, etc.).
+      ingress-routes:
+        api:
+          path-prefix: /
+  checks:
+    readiness:
+      code: http-get-service("sie/gateway", "http", "/readyz") get-member("status") 200 equal?
+      period: 5
+      initialDelay: 5
+      attempts: 60
+
+worker:
+  defines: runnable
+  metadata:
+    name: SIE Worker (CPU / default bundle)
+    description: SIE worker pool — Python adapter + Rust worker-sidecar. Pulls work from JetStream, serves embeddings.
+  permitted-secrets:
+    hf-token: true
+  connections:
+    nats:
+      runnable: sie/nats
+      service: client
+    gateway:
+      runnable: sie/gateway
+      service: http
+    config:
+      runnable: sie/config
+      service: http
+  depends:
+    wait-for:
+      runnables:
+        - sie/nats
+        - sie/gateway
+        - sie/config
+      timeout: 300
+  variables:
+    hf-token:
+      type: string
+      value: <- secret("hf-token")
+      env: HF_TOKEN
+      description: HuggingFace read token — used by the adapter to download model weights.
+    nats-url:
+      type: string
+      value: <- connection-hostname("nats") set-tmp("host") connection-port("nats") set-tmp("port") `nats://${host}:${port}`
+      env: SIE_NATS_URL
+    gateway-url:
+      type: string
+      value: <- connection-hostname("gateway") set-tmp("host") connection-port("gateway") set-tmp("port") `http://${host}:${port}`
+      env: SIE_GATEWAY_URL
+    config-service-url:
+      type: string
+      value: <- connection-hostname("config") set-tmp("host") connection-port("config") set-tmp("port") `http://${host}:${port}`
+      env: SIE_CONFIG_SERVICE_URL
+    trusted-producers:
+      type: string
+      value: sie-config
+      env: SIE_NATS_CONFIG_TRUSTED_PRODUCERS
+    worker-id:
+      type: string
+      value: sie-worker-cpu-0
+      env: SIE_WORKER_ID
+    machine-profile:
+      type: string
+      value: cpu
+      env: SIE_MACHINE_PROFILE
+    pool:
+      type: string
+      value: default
+      env: SIE_POOL
+    bundle:
+      type: string
+      value: default
+      env: SIE_BUNDLE
+    model-ready-timeout:
+      type: string
+      value: "900"
+      env: SIE_MODEL_READY_TIMEOUT_S
+    liveness-budget:
+      type: string
+      value: "1080"
+      env: SIE_WORKER_LIVENESS_BUDGET_S
+    ipc-socket:
+      type: string
+      value: /var/run/sie/ipc.sock
+      env: SIE_IPC_SOCKET_PATH
+    tokenizer-staging:
+      type: string
+      value: /var/run/sie/tokenizers
+      env: SIE_TOKENIZER_STAGING_DIR
+    hf-home:
+      type: string
+      value: /models/huggingface
+      env: HF_HOME
+    log-level:
+      type: string
+      value: INFO
+      env: SIE_LOG_LEVEL
+    log-json:
+      type: string
+      value: "true"
+      env: SIE_LOG_JSON
+    nak-delay:
+      type: string
+      value: "5"
+      env: SIE_NAK_DELAY_S
+    max-deliver:
+      type: string
+      value: "20"
+      env: SIE_MAX_DELIVER
+    nats-fetch-budget:
+      type: string
+      value: "64"
+      env: SIE_NATS_FETCH_BUDGET
+    stream-max-age:
+      type: string
+      value: "1800"
+      env: SIE_STREAM_MAX_AGE_S
+  containers:
+    worker:
+      image: ghcr.io/superlinked/sie-server:v0.6.16-cpu-default
+      restart: unless-stopped
+      user: 0
+      bash: /sie-entrypoint.sh
+      variables:
+        device:
+          type: string
+          value: cpu
+          env: SIE_DEVICE
+        gpu-type:
+          type: string
+          value: cpu
+          env: SIE_GPU_TYPE
+        variant:
+          type: string
+          value: cpu-default
+          env: SIE_VARIANT
+        deployment-env:
+          type: string
+          value: production
+          env: SIE_DEPLOYMENT_ENV
+        ipc-require-heartbeat:
+          type: string
+          value: "true"
+          env: SIE_IPC_REQUIRE_HEARTBEAT
+      paths:
+        - <- `${volume-path}/sie-model-cache:/models`
+        - <- `${volume-path}/sie-ipc:/var/run/sie`
+    sidecar:
+      image: ghcr.io/superlinked/sie-server-sidecar:v0.6.16
+      restart: unless-stopped
+      user: 0
+      variables:
+        metrics-port:
+          type: int
+          value: 9095
+          env: SIE_WORKER_METRICS_PORT
+        rust-log:
+          type: string
+          value: info
+          env: RUST_LOG
+        pipeline-depth:
+          type: string
+          value: "2"
+          env: SIE_RUST_PIPELINE_DEPTH
+        batcher-coalesce:
+          type: string
+          value: "5"
+          env: SIE_BATCHER_COALESCE_MS
+        batcher-max-batch:
+          type: string
+          value: "12"
+          env: SIE_BATCHER_MAX_BATCH_REQUESTS
+        adaptive-min-quantum:
+          type: string
+          value: "2"
+          env: SIE_ADAPTIVE_MIN_QUANTUM_MS
+        adaptive-max-quantum:
+          type: string
+          value: "15"
+          env: SIE_ADAPTIVE_MAX_QUANTUM_MS
+        adaptive-target-p50:
+          type: string
+          value: "50"
+          env: SIE_ADAPTIVE_TARGET_P50_MS
+        config-poll-interval:
+          type: string
+          value: "30000"
+          env: SIE_WORKER_CONFIG_POLL_INTERVAL_MS
+        config-full-export-interval:
+          type: string
+          value: "300000"
+          env: SIE_WORKER_CONFIG_FULL_EXPORT_INTERVAL_MS
+        health-publish:
+          type: string
+          value: "true"
+          env: SIE_HEALTH_PUBLISH_ENABLED
+        pool-admission-enabled:
+          type: string
+          value: "true"
+          env: SIE_POOL_ADMISSION_ENABLED
+        pool-admission-check-interval:
+          type: string
+          value: "10"
+          env: SIE_POOL_ADMISSION_CHECK_INTERVAL_S
+        pool-admission-pause:
+          type: string
+          value: "1"
+          env: SIE_POOL_ADMISSION_PAUSE_S
+        pool-admission-stale-after:
+          type: string
+          value: "30"
+          env: SIE_POOL_ADMISSION_STALE_AFTER_S
+      paths:
+        - <- `${volume-path}/sie-ipc:/var/run/sie`
+  services:
+    http:
+      container: worker
+      port: 8080
+      protocol: tcp
+      description: Worker adapter HTTP (/healthz, /livez, /readyz).
+    metrics:
+      container: sidecar
+      port: 9095
+      protocol: tcp
+      description: worker-sidecar Prometheus metrics.
+  files:
+    entrypoint:
+      container: worker
+      path: /sie-entrypoint.sh
+      mode: 0755
+      contents: |
+        #!/bin/sh
+        mkdir -p /var/run/sie
+        chmod 0777 /var/run/sie
+        ( while true; do [ -S /var/run/sie/ipc.sock ] && chmod 0666 /var/run/sie/ipc.sock; sleep 1; done ) &
+        exec sie-server serve --host=0.0.0.0 --port=8080 --bundle=default
+  checks:
+    readiness:
+      code: http-get-service("sie/worker", "http", "/readyz") get-member("status") 200 equal?
+      period: 10
+      initialDelay: 15
+      attempts: 90
